@@ -240,6 +240,45 @@
   .empty-note { color: var(--ink-soft); font-size: 14px; margin-top: 12px; }
   .split-note { color: var(--ink-soft); font-size: 12.5px; }
 
+  /* ---------- import ---------- */
+  details.importer summary {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .09em;
+    color: var(--ink-soft);
+    cursor: pointer;
+    user-select: none;
+  }
+  details.importer summary:hover { color: var(--ink); }
+  details.importer[open] summary { margin-bottom: 12px; }
+  .import-hint { color: var(--ink-soft); font-size: 13px; margin: 0 0 10px; }
+  textarea#import-text {
+    width: 100%;
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    padding: 8px 10px;
+    resize: vertical;
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    color: inherit;
+  }
+  .import-actions { display: flex; gap: 8px; margin-top: 8px; }
+  .import-preview { margin-top: 14px; border-top: 1px dashed var(--line); padding-top: 12px; }
+  .import-preview .p-row {
+    display: flex; align-items: center; gap: 9px;
+    padding: 3px 0;
+  }
+  .import-preview .p-row input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px; flex: none; }
+  .import-preview .p-name { overflow-wrap: anywhere; }
+  .import-preview .p-amt { margin-left: auto; white-space: nowrap; }
+  .import-preview .p-charge { color: var(--ink-soft); }
+  .import-note { font-size: 13px; color: var(--ink-soft); margin: 8px 0 0; }
+  .import-note.warn { color: var(--warn); font-weight: 500; }
+  .import-note.ok { color: var(--accent); font-weight: 600; }
+
   /* ---------- tax & tip ---------- */
   .charges { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 480px) { .charges { grid-template-columns: 1fr; } }
@@ -331,6 +370,29 @@
           <button class="primary" type="submit">Add</button>
         </form>
         <div class="people-list" id="people-list"></div>
+      </section>
+
+      <section class="panel">
+        <details class="importer" id="importer">
+          <summary>Import a receipt</summary>
+          <p class="import-hint">
+            Copy the text straight off a photo of the receipt (press-and-hold on iPhone,
+            Google Lens on Android) and paste it below — items, tax, and tip are picked out
+            for review before anything lands on the check.
+          </p>
+          <textarea id="import-text" rows="6" spellcheck="false"
+placeholder="PAD THAI          14.50
+GREEN CURRY       16.00
+2 x THAI ICED TEA  9.00
+SUBTOTAL          39.50
+TAX                3.50
+TIP                8.00"></textarea>
+          <div class="import-actions">
+            <button class="primary" type="button" id="parse-btn">Parse receipt</button>
+            <button type="button" id="import-clear">Clear</button>
+          </div>
+          <div class="import-preview" id="import-preview" hidden></div>
+        </details>
       </section>
 
       <section class="panel">
@@ -637,6 +699,236 @@
     return lines.join('\n');
   }
 
+  // ---------- receipt text parsing ----------
+  // Turns pasted OCR text (Live Text / Google Lens / a Claude transcription)
+  // into {items, tax, tip, tipInferred, warnings, skipped}. Handles a customer
+  // copy and merchant copy pasted together: duplicate item blocks are merged,
+  // and the tip comes from whichever copy has one.
+  const MONEY_RE = /(-?)\(?\$?\s*(\d[\d,]*[.,]\d{2})\)?\s*$/;
+  // Only consulted for lines that DO carry a money amount (payment lines like
+  // "CASH 60.00", "VISA XXXX4821 52.25"). Word boundaries matter: without
+  // them, "Cashew Chicken 12.00" matches "cash" and vanishes silently.
+  const NOISE_RE = /\b(visa|mastercard|amex|discover|debit|credit|cash|change|cardholder|emv|auth|approved?|invoice|thank|welcome|signature)\b|entry\s*method|rev\s*center|dine\s*in|order\s*type|card\s*#|x{2,}\d|\*{2,}\d|order\s*#|check\s*#|www\.|https?:|\.com\b|\btel[:\s]|phone|\d{3}[-.).\s]\s?\d{3}[-.\s]\d{4}|\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}/i;
+  const COPY_RE = /\b(customer|merchant|guest|restaurant)\s+copy\b|\bcopy\b\s*$/i;
+
+  function centsFrom(numStr, neg) {
+    let s = numStr.replace(/\s/g, '');
+    if (s.includes('.')) s = s.replace(/,/g, '');       // 1,234.56 -> thousands
+    else s = s.replace(',', '.');                        // 8,50 -> decimal comma
+    const n = parseFloat(s);
+    if (!isFinite(n)) return null;
+    return (neg ? -1 : 1) * Math.round(n * 100);
+  }
+
+  function parseReceiptText(text) {
+    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const blocks = [];
+    let blk = { items: [], rawItems: [], subtotal: null, tax: null, tip: null, total: null };
+    const skipped = [];
+    const pushBlock = () => {
+      if (blk.rawItems.length || blk.subtotal !== null || blk.tax !== null ||
+          blk.tip !== null || blk.total !== null) blocks.push(blk);
+      blk = { items: [], rawItems: [], subtotal: null, tax: null, tip: null, total: null };
+    };
+
+    for (const line of lines) {
+      const m = line.match(MONEY_RE);
+      if (!m) {
+        // Handwritten tips/totals are often written without a decimal point
+        // ("Tip 37 48", "Total 240 00") — accept dollars-space-cents on
+        // charge-labeled lines only.
+        const hw = line.match(/^(tip|gratuity|grand\s*total|total|amount\s*(?:paid|due)?|balance(?:\s*due)?)\b\D*?(\d{1,4})[\s.,]+(\d{2})\s*$/i);
+        if (hw) {
+          const c = (+hw[2]) * 100 + (+hw[3]);
+          if (/tip|gratuity/i.test(hw[1])) { blk.tip = c; } else { blk.total = c; pushBlock(); }
+          continue;
+        }
+        if (COPY_RE.test(line)) pushBlock();
+        continue; // no amount on the line: heading, address, etc.
+      }
+      const cents = centsFrom(m[2], m[1] === '-' || /\(\$?\s*\d/.test(line.slice(m.index)));
+      if (cents === null) continue;
+      let label = line.slice(0, m.index).replace(/[.…:*\-\s]+$/, '').trim()
+        .replace(/\s+N\/A$/i, ''); // "Mimosa N/A$13.00" on digital receipts
+      const key = label.toLowerCase();
+      // "Large Party (20.00%)", "Service Charge (18%)" — a sane gratuity
+      // percentage marks the line as tip, whatever it's called
+      const pct = key.match(/\(\s*(\d{1,2}(?:\.\d+)?)\s*%\s*\)/);
+      const pctGratuity = pct && +pct[1] >= 5 && +pct[1] <= 60;
+
+      if (/^sub\s*-?\s*total/.test(key)) {
+        blk.subtotal = cents;
+      } else if (/(^|\s)(tax|hst|gst|pst|vat)\b/.test(key)) {
+        blk.tax = (blk.tax || 0) + cents;
+      } else if (cents > 0 && (/\b(tip|gratuity)\b/.test(key) ||
+                 /\bservice\s*(charge|chg|fee)\b|\bsvc\b|\bauto\s*grat|\blarge\s*party\b/.test(key) ||
+                 pctGratuity)) {
+        blk.tip = (blk.tip || 0) + cents; // tip + auto-gratuity accumulate
+      } else if (/^(grand\s*total|total|balance(\s*due)?|amount\s*(due|paid)|amt\s*due)$/.test(key)) {
+        blk.total = cents;
+        pushBlock(); // a total usually ends one copy of the receipt
+      } else if (NOISE_RE.test(line)) {
+        continue;
+      } else if (cents <= 0) {
+        skipped.push(line); // discounts/voids — flag for the user, don't guess
+      } else if (!label) {
+        skipped.push(line);
+      } else {
+        // Quantity forms: "2 x Coke 6.00" and QTY-column "Coke 2  6.00" are
+        // definite. A bare lead ("3 Kronembourg$27.00") is only a candidate —
+        // it's a qty column if most item lines look that way (digital
+        // receipts), but "3 Cheese Pizza" on a mixed receipt is just a name.
+        const entry = { label, cents, qty: 1, rest: null, definite: false };
+        const lead = label.match(/^(\d{1,2})\s*[x@]\s+(.+)/i);
+        const trail = label.match(/^(.+?)\s+(\d{1,2})$/);
+        const bare = label.match(/^(\d{1,2})\s+(\S.*)$/);
+        if (lead) { entry.qty = +lead[1]; entry.rest = lead[2].trim(); entry.definite = true; }
+        else if (trail && +trail[2] >= 1 && +trail[2] <= 12) { entry.qty = +trail[2]; entry.rest = trail[1].trim(); entry.definite = true; }
+        else if (bare && +bare[1] >= 1 && +bare[1] <= 12) { entry.qty = +bare[1]; entry.rest = bare[2].trim(); }
+        blk.rawItems.push(entry);
+      }
+    }
+    pushBlock();
+
+    // Decide the bare-lead question globally, then expand quantities.
+    // The line price is the extended total, so "3 Kronembourg$27.00"
+    // becomes three $9.00 items assignable to different people.
+    const rawAll = blocks.flatMap(b => b.rawItems);
+    const bareCount = rawAll.filter(e => !e.definite && e.rest).length;
+    const applyBare = bareCount >= 2 && bareCount / Math.max(1, rawAll.length) >= 0.7;
+    for (const b of blocks) {
+      for (const e of b.rawItems) {
+        const useQty = e.definite || (applyBare && e.rest);
+        if (useQty && e.qty > 1) {
+          // expanded flag: these legit duplicates must survive the
+          // duplicated-copy halving heuristic below
+          splitEven(e.cents, e.qty, 0).forEach(c => b.items.push({ name: e.rest, cents: c, expanded: true }));
+        } else {
+          b.items.push({ name: useQty ? e.rest : e.label, cents: e.cents });
+        }
+      }
+    }
+
+    // Merge blocks whose item lists are identical (customer + merchant copy
+    // both itemized). Charges merge too: tip prefers the later copy, since
+    // the merchant copy with the written-in tip usually prints second.
+    const sig = b => b.items.map(i => i.name.toLowerCase() + '|' + i.cents).sort().join('\n');
+    const merged = [];
+    for (const b of blocks) {
+      const dup = b.items.length && merged.find(x => sig(x) === sig(b));
+      if (dup) {
+        if (b.tip !== null) dup.tip = b.tip;
+        if (dup.tax === null) dup.tax = b.tax;
+        if (dup.subtotal === null) dup.subtotal = b.subtotal;
+        if (b.total !== null) dup.total = b.total;
+      } else {
+        merged.push({ ...b, items: [...b.items] });
+      }
+    }
+
+    // Within one block: OCR sometimes runs both copies together with no
+    // boundary line — if the item list is exactly two identical halves, halve it.
+    for (const b of merged) {
+      const n = b.items.length;
+      if (n >= 2 && n % 2 === 0 && !b.items.some(i => i.expanded)) {
+        const h = n / 2;
+        const same = b.items.slice(0, h).every((it, i) =>
+          it.name.toLowerCase() === b.items[h + i].name.toLowerCase() &&
+          it.cents === b.items[h + i].cents);
+        if (same) b.items = b.items.slice(0, h);
+      }
+    }
+
+    const items = merged.flatMap(b => b.items);
+    const subtotal = merged.map(b => b.subtotal).find(v => v !== null) ?? null;
+    const tax = merged.map(b => b.tax).find(v => v !== null) ?? null;
+    let tip = null;
+    for (const b of merged) if (b.tip !== null) tip = b.tip; // last one wins
+    const totals = merged.map(b => b.total).filter(v => v !== null);
+    const maxTotal = totals.length ? Math.max(...totals) : null;
+
+    // Merchant copy with a handwritten total but no legible tip line:
+    // infer tip = grand total - (subtotal + tax), within sane bounds.
+    let tipInferred = false;
+    const base = (subtotal ?? items.reduce((a, i) => a + i.cents, 0)) + (tax ?? 0);
+    if (tip === null && maxTotal !== null && base > 0 && maxTotal > base) {
+      const t = maxTotal - base;
+      if (t <= Math.round(base * 0.6)) { tip = t; tipInferred = true; }
+    }
+
+    const warnings = [];
+    const itemsSum = items.reduce((a, i) => a + i.cents, 0);
+    if (subtotal !== null && itemsSum !== subtotal) {
+      warnings.push(`Items add up to ${fmt(itemsSum)} but the receipt says subtotal ${fmt(subtotal)} — a line may have been misread. Check before splitting.`);
+    }
+    return { items, tax, tip, tipInferred, warnings, skipped };
+  }
+
+  // ---------- import UI ----------
+  let pendingImport = null;
+
+  function renderImportPreview(r) {
+    const box = $('import-preview');
+    pendingImport = r;
+    if (!r) { box.hidden = true; box.innerHTML = ''; return; }
+    box.hidden = false;
+    if (!r.items.length && r.tax === null && r.tip === null) {
+      box.innerHTML = `<p class="import-note warn">Couldn't find any priced lines in that text. Each item needs its price at the end of the line, like <span class="mono">Pad Thai 14.50</span>.</p>`;
+      pendingImport = null;
+      return;
+    }
+    let html = r.items.map((it, i) => `
+      <label class="p-row">
+        <input type="checkbox" data-import-check="${i}" checked>
+        <span class="p-name">${esc(it.name)}</span>
+        <span class="p-amt mono">${fmt(it.cents)}</span>
+      </label>`).join('');
+    if (r.tax !== null) html += `<div class="p-row p-charge"><span class="p-name">Tax → tax field</span><span class="p-amt mono">${fmt(r.tax)}</span></div>`;
+    if (r.tip !== null) html += `<div class="p-row p-charge"><span class="p-name">Tip${r.tipInferred ? ' (inferred from the written-in total)' : ''} → tip field</span><span class="p-amt mono">${fmt(r.tip)}</span></div>`;
+    r.warnings.forEach(w => { html += `<p class="import-note warn">${esc(w)}</p>`; });
+    if (r.skipped.length) {
+      html += `<p class="import-note">Skipped ${r.skipped.length} line${r.skipped.length > 1 ? 's' : ''} (discounts or unreadable): ${r.skipped.slice(0, 4).map(esc).join(' · ')}${r.skipped.length > 4 ? ' …' : ''}</p>`;
+    }
+    html += `<div class="import-actions"><button class="primary" type="button" id="import-confirm">Add to the check</button></div>`;
+    box.innerHTML = html;
+  }
+
+  $('parse-btn').addEventListener('click', () => {
+    renderImportPreview(parseReceiptText($('import-text').value));
+  });
+
+  $('import-clear').addEventListener('click', () => {
+    $('import-text').value = '';
+    renderImportPreview(null);
+  });
+
+  function confirmImport() {
+    if (!pendingImport) return;
+    let added = 0;
+    document.querySelectorAll('[data-import-check]').forEach(cb => {
+      if (!cb.checked) return;
+      const it = pendingImport.items[+cb.dataset.importCheck];
+      state.items.push({ id: state.nextId++, name: it.name, cents: it.cents, people: [] });
+      added++;
+    });
+    const gotTax = pendingImport.tax !== null;
+    const gotTip = pendingImport.tip !== null;
+    if (gotTax) {
+      state.taxCents = pendingImport.tax;
+      $('tax').value = (state.taxCents / 100).toFixed(2);
+    }
+    if (gotTip) {
+      state.tipMode = 'custom';
+      state.tipCustomCents = pendingImport.tip;
+    }
+    $('import-text').value = '';
+    const box = $('import-preview');
+    pendingImport = null;
+    render();
+    box.hidden = false;
+    box.innerHTML = `<p class="import-note ok">Added ${added} item${added === 1 ? '' : 's'}${gotTax ? ', tax' : ''}${gotTip ? ' and tip' : ''}. Now tap names on each item to assign it.</p>`;
+  }
+
   // ---------- events ----------
   $('person-form').addEventListener('submit', e => {
     e.preventDefault();
@@ -688,6 +980,8 @@
       const everyone = state.people.map(p => p.id);
       item.people = item.people.length === everyone.length ? [] : everyone;
       render();
+    } else if (t.id === 'import-confirm') {
+      confirmImport();
     }
   });
 
