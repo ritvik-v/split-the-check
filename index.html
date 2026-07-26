@@ -1003,7 +1003,7 @@ TIP                8.00"></textarea>
 
   // One call contract for every Gemini use: tries model ids in order,
   // remembers the first that answers, returns the response text.
-  async function geminiCall(requestBody) {
+  async function geminiCall(requestBody, timeoutMs) {
     const key = getGeminiKey();
     const body = JSON.stringify(requestBody);
     let saved = null;
@@ -1013,26 +1013,45 @@ TIP                8.00"></textarea>
     let lastErr = null;
     for (const model of models) {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 60000);
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs || 60000);
       let res;
       try {
         // key travels in a header, not the URL, so it can't land in URL logs
         res = await fetch(
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
           { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body, signal: ctrl.signal });
+      } catch (e) {
+        // no HTTP response at all — name the reason so the fix is actionable
+        throw new Error(e && e.name === 'AbortError' ? 'timeout' : 'network');
       } finally {
         clearTimeout(timer);
       }
       if (res.status === 404) { lastErr = new Error('model'); continue; } // model id retired; try next
-      if (res.status === 400 || res.status === 401 || res.status === 403) throw new Error('key');
+      if (res.status === 401 || res.status === 403) throw new Error('key');
       if (res.status === 429) throw new Error('quota');
-      if (!res.ok) throw new Error('http ' + res.status);
+      if (res.status === 400) {
+        // 400 is ambiguous: an invalid key OR a request this model rejects
+        // (e.g. a tool it doesn't support). Only the former is a key problem;
+        // for the latter, try the next model and keep the key.
+        let apiMsg = '';
+        try { apiMsg = (await res.json())?.error?.message || ''; } catch (e) {}
+        if (/api key/i.test(apiMsg)) throw new Error('key');
+        lastErr = new Error('api:' + apiMsg.slice(0, 200));
+        continue;
+      }
+      if (!res.ok) {
+        let apiMsg = '';
+        try { apiMsg = (await res.json())?.error?.message || ''; } catch (e) {}
+        throw new Error('api:' + (apiMsg.slice(0, 200) || 'HTTP ' + res.status));
+      }
       try { localStorage.setItem(GEMINI_MODEL_LS, model); } catch (e) {}
-      const out = await res.json();
-      return out?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
+      return await res.json();
     }
     throw lastErr || new Error('model');
   }
+
+  const candidateText = out =>
+    out?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
 
   async function geminiParse(imgs) {
     setScanStatus('Reading the photo with Gemini…');
@@ -1040,24 +1059,31 @@ TIP                8.00"></textarea>
     const parts = [{ text: AI_PROMPT }];
     for (const f of imgs) parts.push({ inline_data: { mime_type: 'image/jpeg', data: await toJpegBase64(f) } });
     setScanProgress(0.5);
-    const text = await geminiCall({
+    const out = await geminiCall({
       contents: [{ parts }],
       generationConfig: { responseMimeType: 'application/json', responseSchema: AI_SCHEMA }
     });
     setScanProgress(0.9);
-    return mapAiResult(JSON.parse(text));
+    return mapAiResult(JSON.parse(candidateText(out)));
   }
 
   async function geminiParseUrl(url) {
     setScanStatus('Fetching the receipt link with Gemini…');
     setScanProgress(0.3);
-    const text = await geminiCall({
+    const out = await geminiCall({
       contents: [{ parts: [{ text: aiUrlPrompt(url) }] }],
       tools: [{ url_context: {} }]
-    });
+    }, 90000); // fetching + reading the page takes longer than a photo
     setScanProgress(0.9);
+    const cand = out?.candidates?.[0] || {};
+    // did Gemini actually manage to fetch the page?
+    const meta = cand.urlContextMetadata || cand.url_context_metadata || {};
+    const urlMeta = (meta.urlMetadata || meta.url_metadata || [])[0] || {};
+    const status = urlMeta.urlRetrievalStatus || urlMeta.url_retrieval_status || '';
+    if (status && !/SUCCESS/i.test(status)) throw new Error('fetch-blocked');
+    const text = candidateText(out);
     const m = text.match(/\{[\s\S]*\}/); // tolerate fences or stray prose
-    if (!m) throw new Error('parse');
+    if (!m) throw new Error(status ? 'parse' : 'fetch-blocked');
     try {
       return mapAiResult(JSON.parse(m[0]));
     } catch (e) {
@@ -1137,7 +1163,11 @@ TIP                8.00"></textarea>
     if (msg === 'quota') return `Gemini's free-tier limit was hit — wait a minute and retry.`;
     if (msg === 'model') return `Couldn't reach a Gemini model with this key. Retry in a moment.`;
     if (msg === 'parse') return `Gemini couldn't read a receipt from that link — open the link yourself, copy the receipt text, and paste it here instead.`;
-    return `Couldn't reach Gemini (network error?). Retry, or paste the receipt text below.`;
+    if (msg === 'fetch-blocked') return `That site wouldn't let Gemini fetch the page (many receipt sites block automated access). Open the link, select all, copy, and paste the text here — that always works.`;
+    if (msg && msg.startsWith('api:')) return `Gemini returned an error: “${esc(msg.slice(4))}”. Retry, or paste the receipt text instead.`;
+    if (msg === 'timeout') return `Gemini took too long to answer — link fetches can be slow. Try once more.`;
+    if (msg === 'network') return `The request to Gemini never left your browser. If you're online, a privacy or ad-blocker extension is probably blocking <span class="mono">generativelanguage.googleapis.com</span> — allowlist it for this site (or try an incognito window with extensions off), then retry. Pasting the receipt text below always works.`;
+    return `Couldn't reach Gemini. Retry, or paste the receipt text below.`;
   }
 
   // A pasted receipt link (Toast, Square, …) — Gemini fetches the page
