@@ -433,8 +433,9 @@
           </div>
           <p class="import-hint">
             Prefer text? Copy it straight off the photo (press-and-hold on iPhone, Google Lens on
-            Android) and paste it below. Scanned photos land here too, so you can fix any
-            misread lines and parse again.
+            Android) and paste it below — or paste a <strong>receipt link</strong> (a Toast or
+            Square receipt URL) and Parse will fetch it. Scanned results land here too, so you
+            can fix any misread lines and parse again.
           </p>
           <textarea id="import-text" rows="6" spellcheck="false"
 placeholder="PAD THAI          14.50
@@ -942,14 +943,21 @@ TIP                8.00"></textarea>
   // Tried in order; the first that responds is remembered.
   const GEMINI_MODELS = ['gemini-3-flash', 'gemini-3-flash-preview', 'gemini-2.5-flash'];
 
-  const AI_PROMPT = `Extract the bill from this photo (or photos) of restaurant receipt(s).
-Rules:
-- The photo may show two copies of the SAME check (an itemized customer copy and a merchant copy). Do not duplicate items across copies. Take items from the itemized copy.
+  const AI_RULES = `Rules:
+- If two copies of the SAME check appear (an itemized customer copy and a merchant copy), do not duplicate items; take items from the itemized copy.
 - The tip is often handwritten on the merchant copy; read it carefully. A handwritten "37 48" means 37.48.
-- "price" is the printed total for that line in dollars; "qty" is the quantity if a quantity column shows more than 1.
+- "price" is the printed total for that line in dollars; "qty" is the quantity when it is more than 1.
 - Exclude subtotal/total/amount-paid/balance lines, card details, addresses, and disclaimers from items.
 - Automatic service charges and large-party gratuities count as the tip.
 - tax: the tax amount in dollars, or null. tip: the tip in dollars (handwritten counts), or null if truly absent. total: the final grand total including tip if visible, else null.`;
+
+  const AI_PROMPT = `Extract the bill from this photo (or photos) of restaurant receipt(s).\n` + AI_RULES;
+
+  // url_context can't be combined with an enforced response schema, so the
+  // URL path asks for raw JSON in the prompt and extracts it tolerantly.
+  const aiUrlPrompt = url => `Fetch the restaurant receipt page at ${url} and extract the bill.\n` +
+    AI_RULES + `\nRespond with ONLY raw JSON, no markdown fences and no commentary, in exactly this shape:
+{"items":[{"name":"string","price":0.00,"qty":1}],"tax":null,"tip":null,"total":null}`;
 
   const AI_SCHEMA = {
     type: 'object',
@@ -993,19 +1001,11 @@ Rules:
     return canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
   }
 
-  async function geminiParse(imgs) {
+  // One call contract for every Gemini use: tries model ids in order,
+  // remembers the first that answers, returns the response text.
+  async function geminiCall(requestBody) {
     const key = getGeminiKey();
-    setScanStatus('Reading the photo with Gemini…');
-    setScanProgress(0.2);
-    const parts = [{ text: AI_PROMPT }];
-    for (const f of imgs) parts.push({ inline_data: { mime_type: 'image/jpeg', data: await toJpegBase64(f) } });
-    setScanProgress(0.45);
-
-    const body = JSON.stringify({
-      contents: [{ parts }],
-      generationConfig: { responseMimeType: 'application/json', responseSchema: AI_SCHEMA }
-    });
-
+    const body = JSON.stringify(requestBody);
     let saved = null;
     try { saved = localStorage.getItem(GEMINI_MODEL_LS); } catch (e) {}
     const models = saved ? [saved, ...GEMINI_MODELS.filter(m => m !== saved)] : GEMINI_MODELS;
@@ -1028,12 +1028,41 @@ Rules:
       if (res.status === 429) throw new Error('quota');
       if (!res.ok) throw new Error('http ' + res.status);
       try { localStorage.setItem(GEMINI_MODEL_LS, model); } catch (e) {}
-      setScanProgress(0.9);
       const out = await res.json();
-      const text = out?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
-      return mapAiResult(JSON.parse(text));
+      return out?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
     }
     throw lastErr || new Error('model');
+  }
+
+  async function geminiParse(imgs) {
+    setScanStatus('Reading the photo with Gemini…');
+    setScanProgress(0.2);
+    const parts = [{ text: AI_PROMPT }];
+    for (const f of imgs) parts.push({ inline_data: { mime_type: 'image/jpeg', data: await toJpegBase64(f) } });
+    setScanProgress(0.5);
+    const text = await geminiCall({
+      contents: [{ parts }],
+      generationConfig: { responseMimeType: 'application/json', responseSchema: AI_SCHEMA }
+    });
+    setScanProgress(0.9);
+    return mapAiResult(JSON.parse(text));
+  }
+
+  async function geminiParseUrl(url) {
+    setScanStatus('Fetching the receipt link with Gemini…');
+    setScanProgress(0.3);
+    const text = await geminiCall({
+      contents: [{ parts: [{ text: aiUrlPrompt(url) }] }],
+      tools: [{ url_context: {} }]
+    });
+    setScanProgress(0.9);
+    const m = text.match(/\{[\s\S]*\}/); // tolerate fences or stray prose
+    if (!m) throw new Error('parse');
+    try {
+      return mapAiResult(JSON.parse(m[0]));
+    } catch (e) {
+      throw new Error('parse');
+    }
   }
 
   function mapAiResult(j) {
@@ -1093,20 +1122,49 @@ Rules:
     } catch (err) {
       setScanStatus('');
       box.hidden = false;
-      const msg = err && err.message;
-      let note;
-      if (msg === 'key') {
-        note = `That Gemini API key was rejected. Check it at aistudio.google.com/apikey and save it again below.`;
-        try { localStorage.removeItem(GEMINI_KEY_LS); } catch (e) {}
-        renderAiUi();
-      } else if (msg === 'quota') {
-        note = `Gemini's free-tier limit was hit — wait a minute and rescan.`;
-      } else if (msg === 'model') {
-        note = `Couldn't reach a Gemini model with this key. Rescan to retry.`;
-      } else {
-        note = `Couldn't reach Gemini (network error?). Rescan to retry, or paste the receipt text below.`;
+      box.innerHTML = `<p class="import-note warn">${aiFailNote(err && err.message)}</p>`;
+    } finally {
+      scanning = false;
+    }
+  }
+
+  function aiFailNote(msg) {
+    if (msg === 'key') {
+      try { localStorage.removeItem(GEMINI_KEY_LS); } catch (e) {}
+      renderAiUi();
+      return `That Gemini API key was rejected. Check it at aistudio.google.com/apikey and save it again below.`;
+    }
+    if (msg === 'quota') return `Gemini's free-tier limit was hit — wait a minute and retry.`;
+    if (msg === 'model') return `Couldn't reach a Gemini model with this key. Retry in a moment.`;
+    if (msg === 'parse') return `Gemini couldn't read a receipt from that link — open the link yourself, copy the receipt text, and paste it here instead.`;
+    return `Couldn't reach Gemini (network error?). Retry, or paste the receipt text below.`;
+  }
+
+  // A pasted receipt link (Toast, Square, …) — Gemini fetches the page
+  // server-side via url_context, so the key-only architecture holds.
+  async function parseFromUrl(url) {
+    if (scanning) return;
+    const box = $('import-preview');
+    if (!getGeminiKey()) {
+      box.hidden = false;
+      box.innerHTML = `<p class="import-note warn">Reading a receipt link needs a free Gemini API key — add one in the scan section above. Or open the link, copy the receipt text, and paste it here.</p>`;
+      return;
+    }
+    scanning = true;
+    $('importer').open = true;
+    try {
+      const result = await geminiParseUrl(url);
+      $('import-text').value = resultToText(result);
+      setScanStatus('');
+      renderImportPreview(result);
+      if (pendingImport && pendingImport.items.length) {
+        box.insertAdjacentHTML('afterbegin',
+          `<p class="import-note">Read from the link with Gemini — uncheck anything that looks wrong, or fix the text above and parse again.</p>`);
       }
-      box.innerHTML = `<p class="import-note warn">${note}</p>`;
+    } catch (err) {
+      setScanStatus('');
+      box.hidden = false;
+      box.innerHTML = `<p class="import-note warn">${aiFailNote(err && err.message)}</p>`;
     } finally {
       scanning = false;
     }
@@ -1184,7 +1242,12 @@ Rules:
   }
 
   $('parse-btn').addEventListener('click', () => {
-    renderImportPreview(parseReceiptText($('import-text').value));
+    const raw = $('import-text').value.trim();
+    if (/^https?:\/\/\S+$/.test(raw)) {
+      parseFromUrl(raw);
+      return;
+    }
+    renderImportPreview(parseReceiptText(raw));
   });
 
   $('import-clear').addEventListener('click', () => {

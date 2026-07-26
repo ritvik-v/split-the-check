@@ -8,9 +8,13 @@ A single-file bill splitter for dinners where everyone ordered their own thing.
   [AI Studio](https://aistudio.google.com/apikey) key, pasted once and stored only in your
   browser's localStorage. Handles angled shots, an itemized customer copy plus a merchant
   copy with a handwritten tip in one photo, and quantity columns.
+- **Paste a receipt link** — a Toast or Square receipt URL pasted into the import box is
+  fetched and parsed by Gemini server-side (`url_context`), so no proxy is needed and the
+  page still only ever talks to the Gemini API.
 - **No key? Paste text** — copy the text off the photo (iPhone Live Text / Google Lens) and
   paste it in; the built-in parser handles duplicated copies, decimal-less handwritten
-  amounts ("Tip 37 48"), and payment-line noise.
+  amounts ("Tip 37 48"), digital-receipt quantity columns, auto-gratuities, and
+  payment-line noise.
 - Assign each item to one or more people; shared items split evenly, penny-exact.
 - Tax and tip divide proportionally to what each person ordered.
 - Everything else stays in `localStorage`; there is no server.
