@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Split a restaurant bill by what each person ordered — scan the receipt, assign items, and divide tax & tip proportionally.">
+<!-- Exfiltration guard: no external scripts at all, and the page may only
+     talk to Gemini. If injected code ever runs, it has nowhere to send the
+     API key. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; connect-src https://generativelanguage.googleapis.com; img-src 'self' data: blob:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; object-src 'none'">
 <meta name="theme-color" content="#FAF7F0" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#1B1A16" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧾</text></svg>">
@@ -241,6 +245,15 @@
   .split-note { color: var(--ink-soft); font-size: 12.5px; }
 
   /* ---------- import ---------- */
+  .ai-setup { border-top: 1px dashed var(--line); margin-top: 12px; padding-top: 12px; }
+  .ai-setup a { color: var(--accent); }
+  .ai-setup .import-hint { margin-bottom: 8px; }
+  .ai-on:not([hidden]) {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin-top: 10px; font-size: 13px; color: var(--ink-soft);
+  }
+  .ai-on button { font-size: 13px; }
+
   details.importer summary {
     font-size: 12px;
     font-weight: 600;
@@ -278,6 +291,25 @@
   .import-note { font-size: 13px; color: var(--ink-soft); margin: 8px 0 0; }
   .import-note.warn { color: var(--warn); font-weight: 500; }
   .import-note.ok { color: var(--accent); font-weight: 600; }
+
+  /* ---------- photo scan ---------- */
+  .scan-zone {
+    border: 1.5px dashed var(--line);
+    border-radius: 8px;
+    padding: 18px 14px;
+    text-align: center;
+    cursor: pointer;
+    background: var(--paper);
+    margin-bottom: 12px;
+  }
+  .scan-zone:hover, .scan-zone.drag { border-color: var(--accent); background: var(--accent-soft); }
+  .scan-zone:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .scan-cta strong { color: var(--accent); }
+  .scan-sub { color: var(--ink-soft); font-size: 12.5px; margin-top: 4px; }
+  .scan-status { margin-top: 8px; font-size: 13px; font-weight: 500; }
+  .scan-progress { height: 4px; background: var(--line); border-radius: 2px; margin-top: 8px; overflow: hidden; }
+  .scan-bar { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  @media (prefers-reduced-motion: reduce) { .scan-bar { transition: none; } }
 
   /* ---------- tax & tip ---------- */
   .charges { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
@@ -374,11 +406,35 @@
 
       <section class="panel">
         <details class="importer" id="importer">
-          <summary>Import a receipt</summary>
+          <summary>Scan or import a receipt</summary>
+          <div class="scan-zone" id="scan-zone" role="button" tabindex="0" aria-label="Scan a receipt photo">
+            <input type="file" id="photo-input" accept="image/*" multiple hidden>
+            <div class="scan-cta"><strong>Scan a photo</strong> — tap to take or choose a picture, drag &amp; drop, or paste an image</div>
+            <div class="scan-sub">One photo or several — a customer copy and a merchant copy with the tip are combined automatically. Photos are read by Google's Gemini API with your key (set up below).</div>
+            <div class="scan-status" id="scan-status" hidden></div>
+            <div class="scan-progress" id="scan-progress" hidden><div class="scan-bar" id="scan-bar"></div></div>
+          </div>
+          <div class="ai-setup" id="ai-setup">
+            <p class="import-hint">
+              <strong>One-time setup:</strong> photo scanning reads angled photos, both receipt copies
+              in one shot, and handwritten tips. Get a free Gemini API key at
+              <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>
+              and paste it here once. The key is stored only in this browser; with AI parsing on, photos
+              are sent to Google's Gemini API under your key.
+            </p>
+            <div class="row">
+              <input type="password" id="gemini-key" placeholder="Paste your Gemini API key" autocomplete="off">
+              <button class="primary" type="button" id="save-key">Save</button>
+            </div>
+          </div>
+          <div class="ai-on" id="ai-on" hidden>
+            <span>Photo scanning is on — photos are read by Gemini with your key.</span>
+            <button class="ghost" type="button" id="remove-key">Remove key</button>
+          </div>
           <p class="import-hint">
-            Copy the text straight off a photo of the receipt (press-and-hold on iPhone,
-            Google Lens on Android) and paste it below — items, tax, and tip are picked out
-            for review before anything lands on the check.
+            Prefer text? Copy it straight off the photo (press-and-hold on iPhone, Google Lens on
+            Android) and paste it below. Scanned photos land here too, so you can fix any
+            misread lines and parse again.
           </p>
           <textarea id="import-text" rows="6" spellcheck="false"
 placeholder="PAD THAI          14.50
@@ -863,6 +919,240 @@ TIP                8.00"></textarea>
     }
     return { items, tax, tip, tipInferred, warnings, skipped };
   }
+
+  // ---------- photo OCR ----------
+  // Two engines. Primary: Google Gemini (user's own AI Studio key, stored in
+  // localStorage) — reads angled multi-receipt photos and handwritten tips.
+  // Fallback: Tesseract.js fully in-browser, for no-key or offline use.
+
+  function setScanStatus(msg) {
+    const el = $('scan-status');
+    el.hidden = !msg;
+    el.textContent = msg || '';
+    if (!msg) { $('scan-progress').hidden = true; $('scan-bar').style.width = '0'; }
+  }
+  function setScanProgress(p) {
+    $('scan-progress').hidden = false;
+    $('scan-bar').style.width = Math.round(Math.min(1, Math.max(0, p)) * 100) + '%';
+  }
+
+  // ----- Gemini -----
+  const GEMINI_KEY_LS = 'split-check-gemini-key';
+  const GEMINI_MODEL_LS = 'split-check-gemini-model';
+  // Tried in order; the first that responds is remembered.
+  const GEMINI_MODELS = ['gemini-3-flash', 'gemini-3-flash-preview', 'gemini-2.5-flash'];
+
+  const AI_PROMPT = `Extract the bill from this photo (or photos) of restaurant receipt(s).
+Rules:
+- The photo may show two copies of the SAME check (an itemized customer copy and a merchant copy). Do not duplicate items across copies. Take items from the itemized copy.
+- The tip is often handwritten on the merchant copy; read it carefully. A handwritten "37 48" means 37.48.
+- "price" is the printed total for that line in dollars; "qty" is the quantity if a quantity column shows more than 1.
+- Exclude subtotal/total/amount-paid/balance lines, card details, addresses, and disclaimers from items.
+- Automatic service charges and large-party gratuities count as the tip.
+- tax: the tax amount in dollars, or null. tip: the tip in dollars (handwritten counts), or null if truly absent. total: the final grand total including tip if visible, else null.`;
+
+  const AI_SCHEMA = {
+    type: 'object',
+    properties: {
+      items: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            name: { type: 'string' },
+            price: { type: 'number' },
+            qty: { type: 'integer' }
+          },
+          required: ['name', 'price']
+        }
+      },
+      tax: { type: 'number', nullable: true },
+      tip: { type: 'number', nullable: true },
+      total: { type: 'number', nullable: true }
+    },
+    required: ['items']
+  };
+
+  const getGeminiKey = () => { try { return localStorage.getItem(GEMINI_KEY_LS) || ''; } catch (e) { return ''; } };
+
+  function renderAiUi() {
+    const has = !!getGeminiKey();
+    $('ai-setup').hidden = has;
+    $('ai-on').hidden = !has;
+  }
+
+  async function toJpegBase64(file) {
+    const bmp = await createImageBitmap(file);
+    const maxDim = Math.max(bmp.width, bmp.height);
+    const scale = maxDim > 2000 ? 2000 / maxDim : 1;
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bmp.width * scale);
+    canvas.height = Math.round(bmp.height * scale);
+    canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    bmp.close();
+    return canvas.toDataURL('image/jpeg', 0.85).split(',')[1];
+  }
+
+  async function geminiParse(imgs) {
+    const key = getGeminiKey();
+    setScanStatus('Reading the photo with Gemini…');
+    setScanProgress(0.2);
+    const parts = [{ text: AI_PROMPT }];
+    for (const f of imgs) parts.push({ inline_data: { mime_type: 'image/jpeg', data: await toJpegBase64(f) } });
+    setScanProgress(0.45);
+
+    const body = JSON.stringify({
+      contents: [{ parts }],
+      generationConfig: { responseMimeType: 'application/json', responseSchema: AI_SCHEMA }
+    });
+
+    let saved = null;
+    try { saved = localStorage.getItem(GEMINI_MODEL_LS); } catch (e) {}
+    const models = saved ? [saved, ...GEMINI_MODELS.filter(m => m !== saved)] : GEMINI_MODELS;
+
+    let lastErr = null;
+    for (const model of models) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 60000);
+      let res;
+      try {
+        // key travels in a header, not the URL, so it can't land in URL logs
+        res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+          { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body, signal: ctrl.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (res.status === 404) { lastErr = new Error('model'); continue; } // model id retired; try next
+      if (res.status === 400 || res.status === 401 || res.status === 403) throw new Error('key');
+      if (res.status === 429) throw new Error('quota');
+      if (!res.ok) throw new Error('http ' + res.status);
+      try { localStorage.setItem(GEMINI_MODEL_LS, model); } catch (e) {}
+      setScanProgress(0.9);
+      const out = await res.json();
+      const text = out?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
+      return mapAiResult(JSON.parse(text));
+    }
+    throw lastErr || new Error('model');
+  }
+
+  function mapAiResult(j) {
+    const items = [];
+    (Array.isArray(j.items) ? j.items : []).forEach(it => {
+      const cents = Math.round((+it.price || 0) * 100);
+      const qty = Math.min(20, Math.max(1, Math.round(+it.qty || 1)));
+      const name = String(it.name || '').trim();
+      if (!name || cents <= 0) return;
+      if (qty > 1) splitEven(cents, qty, 0).forEach(c => items.push({ name, cents: c }));
+      else items.push({ name, cents });
+    });
+    const money = v => (typeof v === 'number' && isFinite(v) && v > 0) ? Math.round(v * 100) : null;
+    const tax = money(j.tax);
+    let tip = money(j.tip), tipInferred = false;
+    const total = money(j.total);
+    const base = items.reduce((a, i) => a + i.cents, 0) + (tax || 0);
+    if (tip === null && total !== null && base > 0 && total > base) {
+      const t = total - base;
+      if (t <= Math.round(base * 0.6)) { tip = t; tipInferred = true; }
+    }
+    return { items, tax, tip, tipInferred, warnings: [], skipped: [] };
+  }
+
+  // Mirror the AI result into the text box so it can be hand-corrected and
+  // re-parsed with the regular Parse button.
+  function resultToText(r) {
+    const lines = r.items.map(i => `${i.name}  ${(i.cents / 100).toFixed(2)}`);
+    if (r.tax !== null) lines.push(`Tax  ${(r.tax / 100).toFixed(2)}`);
+    if (r.tip !== null) lines.push(`Tip  ${(r.tip / 100).toFixed(2)}`);
+    return lines.join('\n');
+  }
+
+  // ----- orchestrator -----
+  let scanning = false;
+
+  async function scanImages(fileList) {
+    const imgs = [...fileList].filter(f => f.type && f.type.startsWith('image/'));
+    if (!imgs.length || scanning) return;
+    $('importer').open = true;
+    const box = $('import-preview');
+    if (!getGeminiKey()) {
+      box.hidden = false;
+      box.innerHTML = `<p class="import-note warn">Photo scanning needs a free Gemini API key — add one below (takes a minute). Or copy the text off the photo and paste it here instead.</p>`;
+      return;
+    }
+    scanning = true;
+    try {
+      const result = await geminiParse(imgs);
+      $('import-text').value = resultToText(result);
+      setScanStatus('');
+      renderImportPreview(result);
+      if (pendingImport && pendingImport.items.length) {
+        box.insertAdjacentHTML('afterbegin',
+          `<p class="import-note">Read with Gemini — uncheck anything that looks wrong, or fix the text above and parse again.</p>`);
+      }
+    } catch (err) {
+      setScanStatus('');
+      box.hidden = false;
+      const msg = err && err.message;
+      let note;
+      if (msg === 'key') {
+        note = `That Gemini API key was rejected. Check it at aistudio.google.com/apikey and save it again below.`;
+        try { localStorage.removeItem(GEMINI_KEY_LS); } catch (e) {}
+        renderAiUi();
+      } else if (msg === 'quota') {
+        note = `Gemini's free-tier limit was hit — wait a minute and rescan.`;
+      } else if (msg === 'model') {
+        note = `Couldn't reach a Gemini model with this key. Rescan to retry.`;
+      } else {
+        note = `Couldn't reach Gemini (network error?). Rescan to retry, or paste the receipt text below.`;
+      }
+      box.innerHTML = `<p class="import-note warn">${note}</p>`;
+    } finally {
+      scanning = false;
+    }
+  }
+
+  // ----- events -----
+  $('scan-zone').addEventListener('click', e => {
+    // the hidden input's own (programmatic) click bubbles back here
+    if (e.target !== $('photo-input')) $('photo-input').click();
+  });
+  $('scan-zone').addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('photo-input').click(); }
+  });
+  $('photo-input').addEventListener('change', e => {
+    scanImages(e.target.files);
+    e.target.value = '';
+  });
+  ['dragover', 'dragleave', 'drop'].forEach(type => {
+    $('scan-zone').addEventListener(type, e => {
+      e.preventDefault();
+      $('scan-zone').classList.toggle('drag', type === 'dragover');
+      if (type === 'drop') scanImages(e.dataTransfer.files);
+    });
+  });
+  document.addEventListener('paste', e => {
+    const files = [...(e.clipboardData?.items || [])]
+      .filter(it => it.type.startsWith('image/'))
+      .map(it => it.getAsFile())
+      .filter(Boolean);
+    if (files.length) { e.preventDefault(); scanImages(files); }
+  });
+  $('save-key').addEventListener('click', () => {
+    const v = $('gemini-key').value.trim();
+    if (!v) return;
+    try { localStorage.setItem(GEMINI_KEY_LS, v); } catch (e) {}
+    $('gemini-key').value = '';
+    renderAiUi();
+  });
+  $('gemini-key').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); $('save-key').click(); }
+  });
+  $('remove-key').addEventListener('click', () => {
+    try { localStorage.removeItem(GEMINI_KEY_LS); localStorage.removeItem(GEMINI_MODEL_LS); } catch (e) {}
+    renderAiUi();
+  });
+  renderAiUi();
 
   // ---------- import UI ----------
   let pendingImport = null;
