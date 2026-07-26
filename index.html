@@ -1003,17 +1003,22 @@ TIP                8.00"></textarea>
 
   // One call contract for every Gemini use: tries model ids in order,
   // remembers the first that answers, returns the response text.
-  async function geminiCall(requestBody, timeoutMs) {
+  // prefKey: which "known-good model" memory to use — photo and URL calls
+  // remember separately, since a model can handle one but stall on the other.
+  async function geminiCall(requestBody, timeoutMs, prefKey) {
     const key = getGeminiKey();
+    const pref = prefKey || GEMINI_MODEL_LS;
     const body = JSON.stringify(requestBody);
     let saved = null;
-    try { saved = localStorage.getItem(GEMINI_MODEL_LS); } catch (e) {}
+    try { saved = localStorage.getItem(pref); } catch (e) {}
     const models = saved ? [saved, ...GEMINI_MODELS.filter(m => m !== saved)] : GEMINI_MODELS;
 
     let lastErr = null;
     for (const model of models) {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), timeoutMs || 60000);
+      // __GEMINI_TIMEOUT_MS is a test hook only
+      const tmo = window.__GEMINI_TIMEOUT_MS || timeoutMs || 60000;
+      const timer = setTimeout(() => ctrl.abort(), tmo);
       let res;
       try {
         // key travels in a header, not the URL, so it can't land in URL logs
@@ -1021,8 +1026,11 @@ TIP                8.00"></textarea>
           `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
           { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body, signal: ctrl.signal });
       } catch (e) {
-        // no HTTP response at all — name the reason so the fix is actionable
-        throw new Error(e && e.name === 'AbortError' ? 'timeout' : 'network');
+        // No HTTP response at all. A hang can be model-specific (a preview
+        // model stalling on a tool), so try the next model rather than give
+        // up; if every model fails the same way, the note names the reason.
+        lastErr = new Error(e && e.name === 'AbortError' ? 'timeout' : 'network');
+        continue;
       } finally {
         clearTimeout(timer);
       }
@@ -1044,7 +1052,7 @@ TIP                8.00"></textarea>
         try { apiMsg = (await res.json())?.error?.message || ''; } catch (e) {}
         throw new Error('api:' + (apiMsg.slice(0, 200) || 'HTTP ' + res.status));
       }
-      try { localStorage.setItem(GEMINI_MODEL_LS, model); } catch (e) {}
+      try { localStorage.setItem(pref, model); } catch (e) {}
       return await res.json();
     }
     throw lastErr || new Error('model');
@@ -1073,7 +1081,7 @@ TIP                8.00"></textarea>
     const out = await geminiCall({
       contents: [{ parts: [{ text: aiUrlPrompt(url) }] }],
       tools: [{ url_context: {} }]
-    }, 90000); // fetching + reading the page takes longer than a photo
+    }, 90000, GEMINI_MODEL_LS + '-url'); // page fetches take longer than photos
     setScanProgress(0.9);
     const cand = out?.candidates?.[0] || {};
     // did Gemini actually manage to fetch the page?
@@ -1237,7 +1245,11 @@ TIP                8.00"></textarea>
     if (e.key === 'Enter') { e.preventDefault(); $('save-key').click(); }
   });
   $('remove-key').addEventListener('click', () => {
-    try { localStorage.removeItem(GEMINI_KEY_LS); localStorage.removeItem(GEMINI_MODEL_LS); } catch (e) {}
+    try {
+      localStorage.removeItem(GEMINI_KEY_LS);
+      localStorage.removeItem(GEMINI_MODEL_LS);
+      localStorage.removeItem(GEMINI_MODEL_LS + '-url');
+    } catch (e) {}
     renderAiUi();
   });
   renderAiUi();
