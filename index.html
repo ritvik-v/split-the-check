@@ -531,8 +531,47 @@ TIP                8.00"></textarea>
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return;
       const s = JSON.parse(raw);
-      if (s && Array.isArray(s.people) && Array.isArray(s.items)) state = s;
+      if (s && Array.isArray(s.people) && Array.isArray(s.items)) {
+        state = s;
+        normalizeIds();
+      }
     } catch (e) {}
+  }
+
+  // Saved state can arrive with ids that break assignment: a missing nextId
+  // makes `nextId++` produce NaN (JSON-saved as null), and duplicate ids make
+  // one row's chips toggle another's. Both fail silently — a tap just does
+  // nothing — so repair everything up front and put nextId above all of them.
+  function normalizeIds() {
+    const used = new Set();
+    let maxId = 0;
+    const keep = v => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || used.has(n)) return false;
+      used.add(n);
+      maxId = Math.max(maxId, n);
+      return true;
+    };
+    const orphanPeople = state.people.filter(p => !keep(p.id));
+    const orphanItems = state.items.filter(it => !keep(it.id));
+
+    const savedNext = Number(state.nextId);
+    let next = Math.max(maxId + 1, Number.isFinite(savedNext) ? savedNext : 0);
+
+    orphanPeople.forEach(p => {
+      const old = p.id;
+      p.id = next++;
+      // only re-point assignments when the old id was unusable; a duplicate
+      // id is ambiguous and re-pointing it would steal the other person's items
+      if (!Number.isFinite(Number(old))) {
+        state.items.forEach(it => {
+          if (Array.isArray(it.people)) it.people = it.people.map(x => x === old ? p.id : x);
+        });
+      }
+    });
+    orphanItems.forEach(it => { it.id = next++; });
+    state.items.forEach(it => { if (!Array.isArray(it.people)) it.people = []; });
+    state.nextId = next;
   }
 
   // ---------- money helpers ----------
@@ -589,23 +628,28 @@ TIP                8.00"></textarea>
       assignedSubtotal += item.cents;
     });
 
-    const weights = per.map(p => p.subtotal);
-    const tipTotal = tipCents(assignedSubtotal);
-    const taxAlloc = allocateProportional(state.taxCents, weights);
-    const tipAlloc = allocateProportional(tipTotal, weights);
+    // Tax and tip are charged against every item, assigned or not. Weighing
+    // them by assigned items alone would make whoever is assigned first carry
+    // the whole bill's tax until the last item is claimed. The share that
+    // belongs to unassigned items is reported, not silently redistributed.
+    const shares = [...per.map(p => p.subtotal), unassignedCents];
+    const tipTotal = tipCents(assignedSubtotal + unassignedCents);
+    const taxAlloc = allocateProportional(state.taxCents, shares);
+    const tipAlloc = allocateProportional(tipTotal, shares);
     per.forEach((p, i) => {
       p.tax = taxAlloc[i];
       p.tip = tipAlloc[i];
       p.total = p.subtotal + p.tax + p.tip;
     });
 
-    const anyoneEating = weights.some(w => w > 0);
+    const sum = arr => arr.reduce((a, b) => a + b, 0);
     return {
       per,
       subtotal: assignedSubtotal,
-      tax: anyoneEating ? state.taxCents : 0,
-      tip: anyoneEating ? tipTotal : 0,
+      tax: sum(taxAlloc.slice(0, per.length)),
+      tip: sum(tipAlloc.slice(0, per.length)),
       grand: per.reduce((a, p) => a + p.total, 0),
+      unallocated: taxAlloc[per.length] + tipAlloc[per.length],
       unassignedCents, unassignedCount
     };
   }
@@ -705,6 +749,9 @@ TIP                8.00"></textarea>
         <div class="line grand"><span class="lbl">TOTAL</span><span class="amt">${fmt(r.grand)}</span></div>`;
       if (r.unassignedCount) {
         html += `<hr><div class="line warnline"><span class="lbl">${r.unassignedCount} unassigned item${r.unassignedCount > 1 ? 's' : ''} — not counted</span><span class="amt">${fmt(r.unassignedCents)}</span></div>`;
+        if (r.unallocated > 0) {
+          html += `<div class="line warnline"><span class="lbl">their share of tax &amp; tip</span><span class="amt">${fmt(r.unallocated)}</span></div>`;
+        }
       }
     }
     html += `<div class="thanks">— THANK YOU, COME AGAIN —</div>`;
@@ -734,11 +781,40 @@ TIP                8.00"></textarea>
     }
   }
 
+  // Rendering replaces the item and people markup wholesale, which destroys
+  // whatever control the keyboard was on. Note which one it was, then put
+  // focus back on its replacement so tabbing doesn't reset to the top of the
+  // page on every assignment.
+  const FOCUS_ATTRS = {
+    toggle: 'data-toggle', all: 'data-all',
+    removeItem: 'data-remove-item', removePerson: 'data-remove-person'
+  };
+
+  function focusKey() {
+    const el = document.activeElement;
+    if (!el || !el.dataset) return null;
+    const name = Object.keys(FOCUS_ATTRS).find(k => el.dataset[k] != null);
+    return name ? [name, el.dataset[name]] : null;
+  }
+
+  function restoreFocus(key) {
+    if (!key) return;
+    const [name, value] = key;
+    const safe = window.CSS && CSS.escape ? CSS.escape(value) : value.replace(/"/g, '\\"');
+    const el = document.querySelector(`[${FOCUS_ATTRS[name]}="${safe}"]`);
+    if (el) { el.focus({ preventScroll: true }); return; }
+    // its row was deleted — land on the field for adding another one back
+    const fallback = $(name === 'removePerson' ? 'person-name' : 'item-name');
+    if (fallback) fallback.focus({ preventScroll: true });
+  }
+
   function render() {
+    const key = focusKey();
     renderPeople();
     renderItems();
     renderTipUI();
     renderOutputs();
+    restoreFocus(key);
     save();
   }
 
@@ -752,7 +828,10 @@ TIP                8.00"></textarea>
       lines.push(`${p.name}: ${fmt(d.total)}  (items ${fmt(d.subtotal)} + tax ${fmt(d.tax)} + tip ${fmt(d.tip)})`);
     });
     lines.push(`Total: ${fmt(r.grand)}`);
-    if (r.unassignedCount) lines.push(`(${r.unassignedCount} unassigned items worth ${fmt(r.unassignedCents)} not included)`);
+    if (r.unassignedCount) {
+      lines.push(`(${r.unassignedCount} unassigned item${r.unassignedCount > 1 ? 's' : ''} worth ${fmt(r.unassignedCents)}` +
+        `${r.unallocated > 0 ? ` plus ${fmt(r.unallocated)} of tax & tip` : ''} not included)`);
+    }
     return lines.join('\n');
   }
 
